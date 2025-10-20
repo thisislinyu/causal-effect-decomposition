@@ -1,0 +1,844 @@
+---
+title: "Causal Effect Decomposition for Polytomous Exposure and Socioeconomic Factor"
+description: |
+  
+  
+#image: rct.PNG   
+# author:
+#   - name: Lin Yu
+#     url: https://github.com/thisislinyu/thesis
+# date: 2025-10-20
+# date-modified: 2025-05-21
+#bibliography: references.bib
+# categories: []
+draft: false
+format:
+  html:
+    page-layout: full
+    sidebar: false
+    mainfont: Josefin Sans
+    toc: false
+    toc-depth: 3
+    code-fold: true
+    code-block-bg: true
+    number-sections: true
+    embed-resources: true
+---
+
+We demonstrate how the four terms in the effect decomposition can be estimated using model-based estimators. 
+
+For illustration, we generated a synthetic dataset that includes two case-mix variables, $X_1$ (continuous) and $X_2$ (dichotomous); 
+a hospital indicator ($A$) with five levels; a socioeconomic factor with three levels; 
+a continuous outcome (\texttt{true\_Y\_cont}); and a binary outcome (\texttt{true\_Y\_bin}).
+
+
+```{r}
+#| message: false
+#| code-fold: true
+library(here)
+library(DT) ## datatable()
+library(tibble) ## tibble()
+library(dplyr)
+library(stringr)
+library(parallel)
+library(data.table) #rbindlist()
+library(here)
+library(nnet)
+library(tictoc)
+library(lme4)
+library(blme)
+library(randomForest)
+library(mlr3)
+library(mlr3learners)
+library(mlr3tuning)
+library(ranger)
+library(caret)
+library(forcats)
+library(tidymodels)
+library(pROC)
+library(xgboost) ## xgb.DMatrix
+library(brms)## posterior_predict
+library(VGAM)
+library(tableone)
+library(haven)
+
+```
+
+```{r}
+## data generating mechanism
+n_treat_param <- 9
+n_socio_param <- 3
+
+param <- list(
+  n_sample = 10000,
+  n_hosp = 5,
+  n_socio = 3,
+  ## X1 model
+  X1_coef_vec = NULL,
+  ## treatment assignment 
+  n_treat_param = n_treat_param, ## number of predictors in treatment assignment model
+  treat_coef_matrix = matrix(
+    c(alpha_A_vec = c(0,0,0,0),  ## length = n_hosp -1
+      beta_X1_vec = c(1, 0,0,0
+      ),
+      beta_X2_vec = c(0, 0,0,0
+      ),
+      beta_Z2_vec = c(0,0,0,0),
+      beta_Z3_vec = c(0,0,0,0),
+      beta_Z2X1_vec = c(2,0,0,0),
+      beta_Z3X1_vec = c(0,0,0,0),
+      beta_Z2X2_vec = c(0,0,0,0),
+      beta_Z3X2_vec = c(0,0,0,0)
+    ),
+    nrow = n_treat_param,
+    byrow = TRUE),
+  ## race assignment
+  
+  n_socio_param = n_socio_param,
+  # race_coef_matrix = matrix(
+  #   c(alpha_Z_vec = c(2, 0),  ## length = n_socio -1
+  #     beta_Z_X1_vec = c(0.1,0.2),
+  #     beta_Z_X2_vec = c(0.2,0.3)
+  #   ),
+  # nrow = n_socio_param,
+  # byrow = TRUE),
+  probZ = c(0.3,0.3,0.4),
+  outcome_coef_vec = c(
+    intercept_coef = 0,
+    X_coef = c(1, 0),           #
+    hospA_coef = c(2, 0, 0,0),       # n_hosp -1
+    raceZ_coef = c(3, 0), # n_socio -1
+    interact_coef = c(0, 0, 0, 0, # A2*Z2, A3*Z2, A4*Z2, A5*Z2
+                      0, 0, 0, 0), # A2*Z3, A3*Z3, A4*Z3, A5*Z3
+    AX1_interact_coef = c(1,0,0,0) , #A2*X1 A3*X1  A4*X1 A5*X1
+    AX2_interact_coef = c(0,0,0,0),
+    ZX1_interact_coef = c(0,0), # Z2X1 Z2*X1
+    ZX2_interact_coef = c(0,0)
+    
+  ),
+  
+  a = 0,
+  b = 1,
+  p = 0.5
+) 
+```
+
+
+```{r}
+#| message: false
+#| warning: false
+disparity_sim_f1 <-function(
+    ##1. samples
+  n_sample,
+  n_hosp,
+  n_socio,
+  ## The cofounding data
+  # dat_X,
+  ## the treatment data
+  ### hosp assignment model coefs
+  X1_coef_vec = NULL, ## length should be 1(intercept) + (n_socio -1)
+  
+  treat_coef_matrix,
+  # treat_dep_Z = FALSE,
+  ## the race data
+  probZ = NULL, 
+  # Z_dep_X = FALSE,
+  race_coef_matrix = NULL,
+  ### outcome model
+  outcome_coef_vec,
+  outcome_type ="cont",
+  a = 0,
+  b = 1,
+  p = 0.5,
+  seed=1017
+){
+  set.seed(seed)
+  n_sample <- n_sample
+  n_hosp <- n_hosp
+  n_socio <- n_socio
+  a <- a
+  b <- b 
+  p <- p
+
+  if( is.null(X1_coef_vec )){
+    X1 <- rnorm(n_sample,mean = a,sd = b)
+  }else{
+    if(n_socio==2){
+      #### XXX add logistic regression here!!!
+      Z <- rbinom(n_sample, size = 1, prob = probZ[1])
+      dat_Z = data.frame(Z =  as.factor(Z+1))
+      
+      probZ_val <- replicate(n = n_sample, probZ,simplify = TRUE) %>% t() %>%
+        data.frame() %>%
+        rlang::set_names( paste0("probZ",c(1:n_socio)))
+      
+      X1_design_matrix <- model.matrix(~Z, data = dat_Z)
+      
+      true_linear_X1 <- X1_design_matrix %*% X1_coef_vec 
+      random_error_X1 <- rnorm(  length(true_linear_X1), mean=0,sd=1) 
+      
+      X1 <- true_linear_X1 + random_error_X1## for linear model, sampling Y (2025-01-30 comment, can I use true_Y_linear for modeling or do I use true_Y_cont??)
+      
+      
+    }else{
+      Z <- rmultinom(n_sample,size=1,prob = probZ) %>%
+        apply(.,2,which.max)
+      probZ_val <- replicate(n = n_sample, probZ,simplify = TRUE) %>% t() %>%
+       data.frame() %>%
+        rlang::set_names( paste0("probZ",c(1:n_socio)))
+      
+      dat_Z = data.frame(Z = Z %>% as.factor())
+      
+      X1_design_matrix <- model.matrix(~Z, data = dat_Z)
+      
+      true_linear_X1 <- X1_design_matrix %*% X1_coef_vec 
+      random_error_X1 <- rnorm(  length(true_linear_X1), mean=0,sd=1) 
+      
+      X1 <- true_linear_X1 + random_error_X1## for linear model, sampling Y (2025-01-30 comment, can I use true_Y_linear for modeling or do I use true_Y_cont??)
+      
+    }
+   
+  }
+
+    X2 <- rbinom(n_sample, size = 1, prob = p)
+
+ 
+
+  dat_X <- data.frame(X1 = X1,
+                      X2 = X2 %>% as.factor())
+  
+ 
+  race_design_matrix <- model.matrix(~., data = dat_X)
+  
+  race_design_matrix <- race_design_matrix[,-1] %>%  ## remove the intercept
+    data.frame() %>%
+    mutate(intercept =1) %>%  ## add back the intercept
+    select(intercept,everything()) %>%
+    as.matrix()
+  
+  
+ 
+ if(!is.null(X1_coef_vec)){ ## if P(X|Z)
+   Z <- Z
+   probZ_val <- probZ_val
+ }else{
+   if(!is.null(race_coef_matrix)){
+     
+     ## check if we have the correct dimension
+     row_check <- dim(race_coef_matrix)[1] == ncol(race_design_matrix)
+     
+     ## cols
+     col_check <- dim(race_coef_matrix)[2] ==n_socio - 1
+     
+     if(row_check!=TRUE | col_check!=TRUE){
+       print("please check the dim of coef matrix of race. assign. model")
+     }
+     
+     logit_val_Z <- race_design_matrix %*% race_coef_matrix ## columns are the logit values
+     
+     ## expit to get the probabilities exp(z)/(1+ sum over(exp2))CHL5210 Lecture 7 slide 30
+     exp_val_Z <- apply(logit_val_Z,2,exp)
+     denominator_Z <-  1+ apply(exp_val_Z,1,sum)
+     probZ_val <- (exp_val_Z/ denominator_Z) %>% data.frame()
+     
+     ## add the reference categroy probability
+     probZ_val$probZ_val_refgroup <- 1/denominator_Z
+     
+     probZ_val <- probZ_val %>% select(ends_with("refgroup"),everything())
+     
+     probZ_val <- probZ_val %>%
+       rlang::set_names( paste0("probZ",c(1:n_socio)))
+     
+     ## the actual race assignment based on model
+     Z <- apply(probZ_val, 1, rmultinom,n=1,size=1) %>%
+       apply(.,2,which.max)
+   }else{
+     ## the actual race assignment based on true probZ
+     Z <- rmultinom(n_sample,size=1,prob = probZ) %>%
+       apply(.,2,which.max)
+     probZ_val <- replicate(n = n_sample, probZ,simplify = TRUE) %>% t() %>% data.frame() %>%
+       rlang::set_names( paste0("probZ",c(1:n_socio)))
+   }
+ }
+  
+  
+  dat_X_Z <-  data.frame(dat_X,
+                         Z = Z %>% as.factor())
+  
+  #if(treat_dep_Z){
+    treat_design_matrix <- model.matrix(~X1+X2+Z+Z*X1+Z*X2, data = dat_X_Z)
+   # treat_design_matrix$tau <- tau
+ # }else{
+  #  treat_design_matrix <- model.matrix(~., data = dat_X)
+ # }
+  
+  treat_design_matrix <- treat_design_matrix[,-1] %>%  ## remove the intercept
+    data.frame() %>%
+    mutate(intercept =1) %>%  ## add back the intercept
+    select(intercept,everything()) %>%
+    as.matrix()
+  
+  ## check if we have the correct dimension
+  row_check <- dim(treat_coef_matrix)[1] == ncol(treat_design_matrix)
+  
+  ## cols
+  col_check <- dim(treat_coef_matrix)[2] ==n_hosp - 1
+  
+  if(row_check!=TRUE | col_check!=TRUE){
+    print("please check the dim of coef matrix of hosp. assign. model")
+  }
+  
+  logit_val <- treat_design_matrix %*% treat_coef_matrix ## columns are the logit values
+  
+  ## expit to get the probabilities exp(z)/(1+ sum over(exp2))CHL5210 Lecture 7 slide 30
+  exp_val <- apply(logit_val,2,exp)
+  denominator <-  1+ apply(exp_val,1,sum)
+  probA_val <- (exp_val/ denominator) %>% data.frame()
+  
+  ## add the reference categroy probability
+  probA_val$probA_val_refgroup <- 1/denominator
+  
+  probA_val <- probA_val %>% 
+    select(ends_with("refgroup"),everything())
+  probA_val <- probA_val %>%
+    rlang::set_names( paste0("probA",c(1:n_hosp)))
+  
+  ## the actual hosp assignment
+  A <- apply(probA_val, 1, rmultinom,n=1,size=1) %>%
+    apply(.,2,which.max)
+  
+  dat_A_Z <-
+    data.frame(
+      A = A %>% as.factor(),
+      Z = Z %>% as.factor()
+    )
+  
+  fake_dat <- cbind(dat_X,dat_A_Z) %>%
+    mutate(y_fake = rnorm(nrow(dat_X)))
+  
+ 
+    fake_m <- lm(y_fake~X1+X2+A*Z+A*X1 +A*X2+Z*X1+Z*X2,data = fake_dat)
+    # outcome_design_matrix <- model.matrix(fake_m)
+    # true_Y_linear <- outcome_design_matrix %*% outcome_coef_vec ## location param for linear model
+
+  
+  outcome_design_matrix <- model.matrix(fake_m)
+
+  ## the outcome under true
+  true_Y_linear <- outcome_design_matrix %*% outcome_coef_vec ## location param for linear model
+  
+  
+  
+  
+ 
+  random_error <- rnorm(  length(true_Y_linear), mean=0,sd=1) 
+  
+  true_Y_cont <- true_Y_linear + random_error## for linear model, sampling Y (2025-01-30 comment, can I use true_Y_linear for modeling or do I use true_Y_cont??)
+  
+  true_Y_cont1 <- apply(true_Y_linear, 1, function(x) rnorm(n =1, mean = x,sd=1))
+  
+  true_Y_prob <- exp(true_Y_linear)/(1+exp(true_Y_linear)) ## location param for logistic model
+  true_Y_bin <- apply(true_Y_prob, 1, function(x) rbinom(n =1, size =1, prob = x)) ## for logistic model, sampling Y
+  
+  probA_x <- data.frame(dat_X,probA_val) %>%
+    unique()
+
+  pop_dat <- data.frame(
+    dat_X,
+    dat_A_Z,
+    #true_Y_linear = true_Y_linear, ## mean param for norm dist
+    true_Y_cont = true_Y_cont, ## sampling from true_Y_linear
+    #true_Y_cont1 = true_Y_cont1,
+    #true_Y_prob = true_Y_prob, ## mean param for binomial dist
+    true_Y_bin = true_Y_bin %>% as.factor(),  ## sampling from true_Y_prob
+    #probA_val, ## true hosp assignment value
+   # probZ_val, ## true race distribution
+    # n_sample = n_sample,
+    n_hosp = n_hosp,
+    n_socio = n_socio
+   # treat_dep_Z = treat_dep_Z
+  )
+  # %>%
+  #   left_join(probAa_x,by = c("X1","X2","A"))
+  
+  return(pop_dat)
+  
+}
+
+```
+
+```{r}
+#| code-fold: true
+## hosp = 5, race = 3-----------------
+
+## generate the data
+sim_dat = disparity_sim_f1(
+    n_sample = param$n_sample,
+    n_hosp = param$n_hosp,
+    n_socio = param$n_socio,
+    X1_coef_vec = param$X1_coef_vec,
+    # dat_X = dat_X,
+    treat_coef_matrix = param$treat_coef_matrix,
+    # treat_dep_Z = param$treat_dep_Z,
+    probZ = param$probZ,
+    race_coef_matrix = param$race_coef_matrix,
+    outcome_coef_vec = param$outcome_coef_vec,
+    outcome_type = "cont",
+    a= param$a,
+    b = param$b,
+    p = param$p,
+    seed = 1017
+  )
+
+str(sim_dat)
+
+sim_dat %>% head() %>%
+datatable()
+
+```
+
+`sim_ed_f` is the main function for effect decomposition. The input requires:
+
+- sim_dat: the working data set. The minimum variable set is: true_Y_bin/true_Y_cont(the observed outcome), A(hospital variable), Z(socioeconomic factor variable),n_hosp(# of hospitals),n_socio(# of socioeconomic factor), and $\boldsymbol{X}$(a collection of case-mix covariates)
+- outcome_type: the data type of the outcome variable, "binary" or "cont"; default = cont (continuous)
+
+```{r}
+sim_ed_f <- function(
+    sim_dat = NULL, ## dataset
+    outcome_type = "cont"
+){
+ sim_dat$id <- c(1:nrow(sim_dat))
+ n_hosp <-  sim_dat[1,"n_hosp"] 
+
+  n_socio <- sim_dat[1,"n_socio"]
+
+  
+ ## run the outcome model
+ ## here we use glm as an example, replace this part with your outcome model
+
+ ###  🌈start of the outcome model
+if(outcome_type=="binary"){
+    outcome_m <- glm(true_Y_bin ~ X1 + X2 + A + Z +A*X1, family = binomial("logit"), data = sim_dat)
+  }else if(outcome_type=="cont"){
+    outcome_m <- glm(true_Y_cont ~  X1 + X2 + A + Z +A*X1, family = gaussian("identity"), data = sim_dat)}
+ ###  end of the outcome model
+  
+  ## generate potential outcomes
+  ### unique Z and A combinations
+   Z_A_combinations <- tidyr::crossing(Z = as.factor(sim_dat$Z),
+                                      A = as.factor(sim_dat$A))
+  
+  ## since Z and A are random variables, we should assign all possible values of Z and A to every patient
+  long_random_sim_dat  <- replicate(n = nrow(Z_A_combinations),
+                                    sim_dat,
+                                    simplify = FALSE ## return a list
+  ) %>%
+    bind_rows() %>%
+    rename(Z_origin = Z,
+           A_origin = A)
+  
+  
+  ## here, we generated Z= z, and A = a different combinations
+  random_Z_A_dat <- Z_A_combinations%>%
+    replicate(n = nrow(sim_dat),
+              simplify = FALSE
+    ) %>%
+    bind_rows() %>%
+    # rename(Zz = Z,
+    #        Aa = A) %>%
+    arrange(Z,A)
+  
+  
+  ## the sim_dat that contains the potential outcome
+  long_random_sim_dat <- cbind(long_random_sim_dat,random_Z_A_dat)
+  
+  ## fit the hospital assignment model,
+  
+  ### 🌈 change this to your hospital assignment model
+  
+  ### start of the hospital assignment model
+   hosp_assign_m <-  multinom_reg() %>% 
+    fit(A ~ X2 + Z*X1, data = sim_dat)  
+  ### end of the hospital assignment model
+  
+   
+   ## get the predicted hospital assignment probability
+  probA_val_Zz <- predict(hosp_assign_m, long_random_sim_dat, type = "prob") %>% data.frame() %>% 
+    rlang::set_names( paste0("probA",c(1:max(sim_dat$n_hosp)),"_Zz"))
+  
+  ## add the hospital assignemnt porobability to the long format dataset
+  long_random_sim_dat <- cbind(long_random_sim_dat,probA_val_Zz)
+  
+  
+  ## get the predicted values of the potential outcomes from outcome model
+  
+  ##🌈 you may need to change the code based on the outcome model you have.
+  
+  ### start of the potential outcome prediction
+   if(outcome_type=="binary"){
+    pred_Ya <- predict(outcome_m, newdata = long_random_sim_dat, type = "response",allow.new.levels = TRUE)
+  }else if(outcome_type=="cont"){
+    pred_Ya <- predict(outcome_m, newdata = long_random_sim_dat, type = "response",allow.new.levels = TRUE)}
+  
+  ### end of the potential outcome  prediction
+ 
+  ### add the potential outcome predicted values to the long format dataste
+   long_random_sim_dat <- long_random_sim_dat %>%
+    mutate(
+      #random_Y_linear = random_Y_linear,
+      random_Y = pred_Ya
+    )
+  
+  ## filter the actual Z (in the ED, we do not need the potential outcome for Z, refer to the formula)
+  long_random_sim_dat_Z <- long_random_sim_dat %>% 
+    filter(Z==Z_origin)
+  
+
+  ### get the wide format data
+  if(outcome_type=="binary"){
+    wide_random_sim_dat <- long_random_sim_dat %>%
+      tidyr::pivot_wider(id_cols = c(id),
+                         names_from =  c(Z,A),
+                         values_from = random_Y,
+                         names_glue = "EY_Z{Z}_A{A}")
+  }else if(outcome_type == "cont"){
+    wide_random_sim_dat <- long_random_sim_dat %>%
+      tidyr::pivot_wider(id_cols = c(id),
+                         names_from =  c(Z,A),
+                         values_from = random_Y,
+                         names_glue = "EY_Z{Z}_A{A}")
+  }
+  
+  
+  if(outcome_type=="binary"){
+    wide_random_sim_dat_Z <- long_random_sim_dat_Z %>%
+      tidyr::pivot_wider(id_cols = c(id,Z_origin,Z),
+                         names_from =  c(A),
+                         values_from = random_Y,
+                         names_glue = "EY_Z_A{A}")
+  }else if(outcome_type == "cont"){
+    wide_random_sim_dat_Z <- long_random_sim_dat_Z %>%
+      tidyr::pivot_wider(id_cols = c(id,Z_origin,Z),
+                         names_from =  c(A),
+                         values_from = random_Y,
+                         names_glue = "EY_Z_A{A}")
+  }
+  
+  ### end of the wide format dataset
+  
+  ## till now, we have all the elements needed for effect decomopositon.
+  ## the following is just some computation for each element in ED
+ 
+  
+  ### Baseline component
+  ## E(Y(a)|Z)
+  EY_Z_Aa_dat <- wide_random_sim_dat_Z %>%
+    group_by(Z) %>%
+    mutate(across(starts_with("EY_Z_A"), mean, .names = "{.col}")) %>% 
+    select(Z,ends_with( (paste0("A",c(1:n_hosp))))) %>% 
+    unique() %>% 
+    ungroup() %>% 
+    select(-Z) %>% t() %>%  data.frame()
+  
+  
+  rownames(EY_Z_Aa_dat) <- paste0("EY_Z_A",c(1:n_hosp))
+  colnames(EY_Z_Aa_dat) <- paste0("Z",c(1:n_socio))
+  
+  EY_Z_Aa_dat %>% datatable()
+  
+  ## convert to a list
+  EY_Z_Aa_list <- lapply(names(EY_Z_Aa_dat), function(colname) {
+    setNames(as.numeric(EY_Z_Aa_dat[[colname]]),
+             paste0(colname, "_", rownames(EY_Z_Aa_dat)))
+  })
+  
+  ## E(Y_bar|Z)
+  EYbar_Z_list <- lapply(EY_Z_Aa_list, mean)
+  
+  # EYbar_Z_list
+  
+  ## pairwise comparison: 
+  
+  ### then the baseline diffs are the pairwise comparison of avg_Ex_EY_Zz_Aa_list
+  
+  ### Generate all pairwise combinations of indices
+  
+  Z_combn <- combn(1:length(EYbar_Z_list) , 2)
+  base_combn <- combn(EYbar_Z_list, 2)
+  
+  pairwise_Z <- data.frame(
+    first_z =  c( Z_combn[1,],Z_combn[2,]),
+    second_z = c(Z_combn[2,],Z_combn[1,])
+  )
+  
+  base_diff = c(
+    as.numeric(base_combn[1,]) - as.numeric(base_combn[2,]),
+    -(as.numeric(base_combn[1,]) - as.numeric(base_combn[2,]))
+  )
+  
+  pairwise_Z$base_diff <- base_diff
+  
+  
+  # E\left[Y(a) - \bar Y \mid Z = z \right]
+  
+  Yeffect_Z_Aa_list <- lapply(1:length(EY_Z_Aa_list),function(i){
+    EY_Z_Aa_list[[i]] - EYbar_Z_list[[i]]
+  } ) ## length of Z
+  
+  
+  Z_ProbA_list <- lapply(c(1:n_socio), function(i){
+    Zz_ProbA <-  long_random_sim_dat_Z %>% 
+      filter(Z==as.character(i)) %>% 
+      # mutate(across(starts_with("probA"), ~ round(., 6))) %>%
+      select(id,Z,starts_with(paste0("probA"))& ends_with("_Zz")) %>%
+      group_by(id) %>%
+      slice_head(n = 1) %>%
+      ungroup() %>% 
+      select(-id,-Z) %>% 
+      data.frame()
+    colnames(Zz_ProbA) = paste0(colnames(Zz_ProbA),i)
+    Zz_ProbA
+  })
+  
+  Z_ProbA_margin_list <- lapply(1:n_socio,function(i){
+    apply(Z_ProbA_list[[i]],2,mean)
+  }) 
+  
+  
+  ### effect modification term
+  Aa_em_diff <- NULL ## a list of n_hosp, each element is of length # of pairwise comparison
+  
+  for(i in c(1:n_hosp)){
+    Ai <- Yeffect_Z_Aa_list %>% unlist() %>% data.frame() %>% t() %>% data.frame() %>% 
+      select(ends_with(paste0("A",i)))
+    
+    em_combn <- combn(Ai, 2)
+    Aa_em_diff  <- rbind(Aa_em_diff, 
+                         
+                         data.frame(A = i,
+                                    pairwise_Z,
+                                    em_diff = c(
+                                      as.numeric(em_combn[1,])- as.numeric(em_combn[2,]),
+                                      as.numeric(em_combn[2,])- as.numeric(em_combn[1,])
+                                    )
+                         )
+    )
+    
+  }
+  
+  Aa_em_diff_wide <- Aa_em_diff %>% pivot_wider(id_cols = c(first_z,second_z),
+                                                names_from = c("A"),values_from = "em_diff",
+                                                names_glue = paste0("EYdiff_","A{A}")
+  )
+  
+  Aa_em_diff_list <- apply( Aa_em_diff_wide,1,list)
+  
+  
+  em_list <- lapply(1:length(Aa_em_diff_list),
+                    function(i){
+                      zindex <- Aa_em_diff_list[[i]][[1]]['first_z']
+                      
+                      Z_ProbA_margin_list[[zindex]]*Aa_em_diff_list[[i]][[1]][-c(1:2)] ## remove the first_z and second_z variable from the list for the purpose of calculation 
+                      
+                    }
+  ) ## length(Aa_em_diff_list) should be 12 (# of comparison)
+  
+  Z_em_dat <- do.call(rbind,em_list)
+  colnames(Z_em_dat) <- paste0("em_A",c(1:n_hosp))
+  
+  em_sum <- apply(Z_em_dat,1,sum)
+  Z_em_dat <- cbind(pairwise_Z,Z_em_dat,em_sum)
+  
+  Z_em_dat %>% select(first_z,second_z,starts_with("em")) %>% datatable()
+  
+  
+  ### prevalence term
+  ProbA_Z_margin_dat <- Z_ProbA_margin_list %>% bind_cols() %>% t() %>% data.frame() 
+  
+  rownames(ProbA_Z_margin_dat) <- paste0("probA_Z",c(1:n_socio))
+  colnames(ProbA_Z_margin_dat) <- paste0("A",c(1:n_hosp))
+  
+  ProbA_Z_margin_list <- lapply(names(ProbA_Z_margin_dat), function(colname) {
+    setNames(as.numeric(ProbA_Z_margin_dat[[colname]]),
+             paste0(colname, "_", rownames(ProbA_Z_margin_dat)))
+  })
+  
+  
+  prev_diff_dat <- lapply(1:n_hosp,function(i){
+    ProbA_combn <- combn(ProbA_Z_margin_list[[i]], 2)
+    prevlance_diff <- data.frame(
+      A = i,
+      pairwise_Z,
+      prev_diff = c(
+        as.numeric(ProbA_combn[1,])- as.numeric(ProbA_combn[2,]),
+        as.numeric(ProbA_combn[2,])- as.numeric(ProbA_combn[1,])
+      )
+      
+    )
+    prevlance_diff 
+    
+  }) %>% bind_rows()
+  
+  
+  prev_diff_dat_wide <- prev_diff_dat %>% pivot_wider(id_cols = c(first_z,second_z),
+                                                      names_from = c("A"),values_from = "prev_diff",
+                                                      names_glue = paste0("prev_","A{A}")
+  )
+  
+  
+  prev_diff_dat_wide_list_Z <- apply( prev_diff_dat_wide,1,list)
+  
+  
+  prev_dat <- lapply(1:length(prev_diff_dat_wide_list_Z),function(i){
+    zstarindex <- prev_diff_dat_wide_list_Z[[i]][[1]]['second_z']
+    prev_diff_dat_wide_list_Z[[i]][[1]][-c(1:2)]*Yeffect_Z_Aa_list[[zstarindex]]
+  }) %>% bind_rows()
+  
+  
+  prev_sum <- apply(prev_dat,1,sum)
+  prev_dat_Z <- cbind(Z_em_dat, prev_dat,prev_sum)
+  prev_dat_Z %>% select("first_z","second_z",starts_with("prev")) %>% datatable()
+  
+  
+  ### Covariance term
+  
+  cov1_second_all <- wide_random_sim_dat_Z %>% 
+    mutate(rowmean_val = rowMeans(across(starts_with("EY_Z"))), ## avg EY over A, condit on Z, X
+           rowdiff_val = across(starts_with("EY_Z")) - rowmean_val
+    )
+  
+  ## P(A|Z,X)
+  Z_ProbA <-  long_random_sim_dat_Z %>% 
+    # mutate(across(starts_with("probA"), ~ round(., 6))) %>%
+    select(id,Z,starts_with(paste0("probA"))& ends_with("_Zz")) %>% 
+    unique()
+  
+  
+  table(Z_ProbA$id == cov1_second_all$id)
+  
+  
+  cov1_second <- cov1_second_all %>% select(starts_with("rowdiff_val")) %>% as.matrix()
+  
+  
+  cov1_first <- Z_ProbA %>% select(starts_with("probA")) %>% as.matrix()
+  
+  cov1_multiply <- cov1_first*cov1_second %>% data.frame()
+  
+  cov1_multiply <- cbind(cov1_multiply,Z_ProbA %>% select(id,Z))
+  
+  
+  cov1_dat <- cov1_multiply %>%
+    group_by(Z) %>%
+    mutate(across(starts_with("rowdiff"), ~ mean(.), .names = "grp_mean_{col}")) %>%
+    ungroup() %>% 
+    select(starts_with("grp_mean"),Z) %>% 
+    unique() %>% 
+    arrange(Z) %>%  ## make sure the order of Z is from Z=1 to 3
+    select(-Z) %>% 
+    t() %>% data.frame()
+  
+  colnames(cov1_dat) <- paste0("Z",c(1:n_socio))
+  
+  rownames(cov1_dat) <- paste0("probA",c(1:n_hosp))
+  
+  cov1_list_Z <- cov1_dat %>% as.list()
+  
+  cov1_list_Z <- lapply(names(cov1_list_Z), function(colname) {
+    setNames(as.numeric(cov1_dat[[colname]]),
+             paste0(colname, "_", rownames(cov1_dat)))
+  })
+  
+  cov2_list_Z <- lapply(c(1:n_socio),function(i){
+    Z_ProbA_margin_list[[i]]*Yeffect_Z_Aa_list[[i]]
+  })
+  
+  cov_list_Z <- lapply(c(1:n_socio),function(i){
+    cov1_list_Z[[i]] - cov2_list_Z[[i]]
+  })
+  
+  # cbind(Z=c(1:n_socio),do.call(rbind,cov_list) )
+  
+  
+  cov_dat_list_Z <- NULL
+  for(i in c(1:nrow(pairwise_Z))){
+    cov_index1 <- pairwise_Z[i,"first_z"]
+    cov_index2 <- pairwise_Z[i,"second_z"]
+    cov_dat_list_Z[[i]] <- cov_list_Z[[cov_index1]] - cov_list_Z[[cov_index2]]
+  }
+  
+  
+  cov_dat_Z <- do.call(rbind,cov_dat_list_Z)
+  
+  colnames(cov_dat_Z) <- paste0("cov_A",c(1:n_hosp))
+  
+  
+  cov_sum <- apply(cov_dat_Z,1,sum)
+  
+  cov_dat_Z <- cbind(prev_dat_Z,cov_dat_Z,cov_sum)  
+  
+  
+  
+  ## observed disparity
+  EY_Z_list <- long_random_sim_dat %>% 
+    filter(A==A_origin & Z==Z_origin) %>% 
+    group_by(Z) %>% 
+    mutate(meanY_Z = mean(random_Y)) %>% 
+    ungroup() %>% 
+    select(meanY_Z) %>% 
+    unique() %>% t() %>% 
+    as.list()
+  
+  
+  effect_combn <- combn(EY_Z_list, 2)
+  
+  
+  effect_diff_Z = c(
+    as.numeric(effect_combn[1,]) - as.numeric(effect_combn[2,]),
+    -(as.numeric(effect_combn[1,]) - as.numeric(effect_combn[2,]))
+  )
+  
+  pairwise_Z$effect_diff  <- effect_diff_Z 
+  
+  
+  # effect_decomp <- base_diff + em_sum + prev_sum +cov_sum
+  
+  
+  
+  # effect_diff
+  # effect_decomp
+  
+  cov_dat_Z <- cov_dat_Z %>% 
+    mutate(effect_decomp = base_diff + em_sum + prev_sum +cov_sum)
+  
+  
+  
+  effect_decomp_dat_Z <- cbind(cov_dat_Z,effect_diff_Z) %>% 
+    select(first_z,second_z,
+    effect_decomp,base_diff,em_sum,prev_sum,cov_sum,everything())  %>% 
+    select(-effect_diff_Z)
+  
+  
+  return(effect_decomp_dat_Z)
+  
+}
+```
+
+The model based estimation results:
+```{r}
+#| message: false
+sim_ed_res <- sim_ed_f(sim_dat = sim_dat,
+         outcome_type = "cont")
+
+sim_ed_res %>% datatable()
+```  
+
+Each row is a pairwise comparison result:       
+- `first_z` and `second_z`: two $Z$ levels to be compared    
+- `effect_decomp`: the overall disparity $E(Y \mid Z =z) - E(Y \mid Z = z^*)$    
+- `base_diff`: baseline term in the decomposition     
+- `em_sum`: effect term in the decomposition      
+- `prev_sum`: prevalence term in the decomposition  
+- `cov_term`: differential selection term in the decompositioin   
+- `em_A1` - `em_A2`: hospital specific values for the effect term     
+- `prev_A1` - `prev_A5`: hospital specific values for prevalence term     
+- `cov_A1` - `cov_A5`:  hospital specific values for differential selection term  
