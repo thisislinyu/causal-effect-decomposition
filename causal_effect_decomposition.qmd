@@ -147,6 +147,7 @@ disparity_sim_f1 <-function(
   ### outcome model
   outcome_coef_vec,
   outcome_type ="cont",
+  baseline_missing, ## true or false
   a = 0,
   b = 1,
   p = 0.5,
@@ -361,11 +362,25 @@ disparity_sim_f1 <-function(
   # %>%
   #   left_join(probAa_x,by = c("X1","X2","A"))
   
+    
+  if(baseline_missing){
+    
+    miss_design_matrix <- model.matrix(~X2+Z, data = dat_X_Z)
+    miss_coef_matrix <- c(-0.5,0.3,0.1,0)
+    logit_val_X1 <- miss_design_matrix %*% miss_coef_matrix ## columns are the logit 
+     exp_val_X1 <- apply(logit_val_X1,2,exp)
+     denominator_X1 <-  1+ apply(exp_val_X1,1,sum)
+     probX1_val <- (exp_val_X1/ denominator_X1) %>% data.frame()
+     pop_dat$X1[probX1_val< 0.3] = NA
+     
+  }
+  
   return(pop_dat)
   
 }
 
 ```
+
 
 ```{r}
 #| code-fold: true
@@ -387,6 +402,7 @@ sim_dat = disparity_sim_f1(
     a= param$a,
     b = param$b,
     p = param$p,
+    baseline_missing = FALSE,
     seed = 1017
   )
 
@@ -397,6 +413,61 @@ datatable()
 
 ```
 
+```{r}
+#| warning: false
+sim_miss_dat = disparity_sim_f1(
+    n_sample = param$n_sample,
+    n_hosp = param$n_hosp,
+    n_socio = param$n_socio,
+    X1_coef_vec = param$X1_coef_vec,
+    # dat_X = dat_X,
+    treat_coef_matrix = param$treat_coef_matrix,
+    # treat_dep_Z = param$treat_dep_Z,
+    probZ = param$probZ,
+    race_coef_matrix = param$race_coef_matrix,
+    outcome_coef_vec = param$outcome_coef_vec,
+    outcome_type = "cont",
+    a= param$a,
+    b = param$b,
+    p = param$p,
+    baseline_missing = TRUE,
+    seed = 1017
+  )
+
+## MI imputation
+library(mice)
+mice0  <- mice(sim_miss_dat, seed = 100, m = 5, maxit = 0, print = F)
+meth <- mice0$method
+
+meth["X1"] <- "pmm" ## this is the default
+
+pred <- mice0$predictorMatrix
+pred[,] <- 0  
+pred["X1", c("X2", "Z")] <- 1 ## use X2 and Z to predict X1
+
+imputed_dat  <- mice(sim_miss_dat, seed = 100, m = 5, maxit = 10,
+                        #,
+                        method = meth,
+                        predictorMatrix = pred
+                       )
+
+## get the imputed dataset
+
+## long data format
+imputed_dat_long <- complete(imputed_dat, "long")
+head(imputed_dat_long)
+
+## list format
+
+imputed_dat_list <- lapply(1:5, function(i) complete(imputed_dat, i))
+
+
+## check and compare the first imputed dataset with the complete data
+imputed_dat_list[[1]][which(is.na(sim_miss_dat$X1)),] %>% head()
+
+sim_dat[which(is.na(sim_miss_dat$X1)),] %>% head()
+
+```
 `sim_ed_f` is the main function for effect decomposition. The input requires:
 
 - sim_dat: the working data set. The minimum variable set is: true_Y_bin/true_Y_cont(the observed outcome), A(hospital variable), Z(socioeconomic factor variable),n_hosp(# of hospitals),n_socio(# of socioeconomic factor), and $\boldsymbol{X}$(a collection of case-mix covariates)
